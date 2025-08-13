@@ -52,23 +52,20 @@ def crop_image(frame: np.ndarray, bbox: np.ndarray) -> Optional[np.ndarray]:
         print(f"Cropping error: {e}")
         return None
 
-def is_inside(child_box: np.ndarray, parent_box: np.ndarray, threshold: float = 0.8) -> bool:
-    """Check if child box is mostly contained in parent box"""
-    if child_box is None or parent_box is None:
+def is_inside(box1, box2, threshold=0.2):  # More lenient threshold
+    """Check if box1 is inside box2"""
+    if box1 is None or box2 is None:
         return False
     
-    # Calculate intersection area
-    inter_x1 = max(child_box[0], parent_box[0])
-    inter_y1 = max(child_box[1], parent_box[1])
-    inter_x2 = min(child_box[2], parent_box[2])
-    inter_y2 = min(child_box[3], parent_box[3])
+    x1, y1, x2, y2 = box1
+    X1, Y1, X2, Y2 = box2
     
-    if inter_x2 < inter_x1 or inter_y2 < inter_y1:
-        return False
+    # Calculate center points
+    center_x = (x1 + x2) / 2
+    center_y = (y1 + y2) / 2
     
-    intersection = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
-    child_area = (child_box[2] - child_box[0]) * (child_box[3] - child_box[1])
-    return (intersection / child_area) > threshold
+    # Check if center point is inside head box with margin
+    return (X1 < center_x < X2 and Y1 < center_y < Y2)
 
 def calculate_area(box):
     """Calculate area of a bounding box"""
@@ -76,14 +73,29 @@ def calculate_area(box):
     height = box[3] - box[1]
     return width * height
 
-def calculate_mar(mouth_box: np.ndarray, head_box: np.ndarray) -> float:
-    if mouth_box is None or head_box is None:
+def calculate_mar(mouth_box, head_box):
+    """
+    Calculate mouth aspect ratio optimized for yawn detection
+    """
+    try:
+        mouth_height = mouth_box[3] - mouth_box[1]
+        mouth_width = mouth_box[2] - mouth_box[0]
+        head_height = head_box[3] - head_box[1]
+        
+        # Calculate vertical opening ratio
+        vertical_ratio = mouth_height / head_height
+        
+        # Calculate aspect ratio
+        aspect_ratio = mouth_height / mouth_width if mouth_width > 0 else 0
+        
+        # Combined MAR that emphasizes vertical opening
+        mar = vertical_ratio * 4.0  # Increase weight of vertical opening
+        
+        print(f"Mouth metrics - Height: {mouth_height:.1f}, Width: {mouth_width:.1f}, MAR: {mar:.3f}")
+        return mar
+    except Exception as e:
+        print(f"Error calculating MAR: {e}")
         return 0.0
-    
-    mouth_height = max(1, mouth_box[3] - mouth_box[1])  # Prevent division by zero
-    head_height = max(1, head_box[3] - head_box[1])  
-
-    return mouth_height / head_height
 
 
 class DrowsinessDetector:
@@ -106,7 +118,10 @@ class DrowsinessDetector:
         self.count_start = False
         self.alarm_on = False
         self.yawn_counter = 0
+        self.yawn_start_time = 0.0
+        self.is_yawn_active = False
         self.both_eyes_closed = False
+        self.mouth_box = None  # Store current mouth box
 
     def load_models(self):
         """Load required models with error handling"""
@@ -131,30 +146,49 @@ class DrowsinessDetector:
             eyes = []
 
             for box, cls in zip(boxes, classes):
-                print(f"Detected class {cls} with box: {box}") 
                 if cls == 1:
                     heads.append(box)
                 elif cls == 2:
                     mouths.append(box)
                 else:  # Assuming other classes are eyes
                     eyes.append(box)
-            print(f"Total Heads: {len(heads)}, Total Mouths: {len(mouths)}, Total Eyes: {len(eyes)}")
+
             # Find largest head
             main_head = max(heads, key=lambda b: (b[2]-b[0])*(b[3]-b[1]), default=None)
             
             # Process mouths
+            max_mar = 0
+            self.mouth_box = None  # Reset mouth box
+            
             for mouth in mouths:
                 if main_head is not None and is_inside(mouth, main_head):
                     mar = calculate_mar(mouth, main_head)
-                    max_mar = max(max_mar, mar)
-                    print(f"MAR: {mar:.2f}, Threshold: {pj.MAR_THRESHOLD}")
+                    if mar > max_mar:
+                        max_mar = mar
+                        self.mouth_box = mouth  # Store the mouth box with highest MAR
 
-            # Update yawn counter
+            # Update yawn state
+            current_time = time.time()
             if max_mar > pj.MAR_THRESHOLD:
-                self.yawn_counter = min(self.yawn_counter + 1, pj.YAWN_CONSEC_FRAMES)
+                if not self.is_yawn_active:
+                    self.yawn_start_time = current_time
+                    self.is_yawn_active = True
+                
+                # Check if yawn has lasted more than 2 seconds
+                if current_time - self.yawn_start_time >= 2.0:
+                    self.yawn_counter = pj.YAWN_CONSEC_FRAMES
+                    print("Yawn detected for more than 2 seconds!")
+                else:
+                    self.yawn_counter = 0
             else:
-                self.yawn_counter = max(self.yawn_counter - 0.5, 0)
-            print(f"Yawn Counter: {self.yawn_counter}")
+                self.is_yawn_active = False
+                self.yawn_counter = 0
+                self.mouth_box = None
+
+            # Draw mouth box if detected
+            if self.mouth_box is not None:
+                x1, y1, x2, y2 = map(int, self.mouth_box)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
             return results[0].plot()
         except Exception as e:
@@ -168,9 +202,14 @@ class DrowsinessDetector:
             cv2.putText(frame, "ALERT: Yawning Detected!", (10, 60),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             self.trigger_alarm()
+        elif self.is_yawn_active:
+            # Show countdown for yawn duration
+            elapsed = time.time() - self.yawn_start_time
+            cv2.putText(frame, f"Yawning: {elapsed:.1f}s", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         # Drowsiness detection logic
-        if self.both_eyes_closed:
+        if self.both_eyes_closed or self.yawn_counter >= pj.YAWN_CONSEC_FRAMES:
             current_time = time.time()
             if not self.count_start:
                 self.start_time = current_time

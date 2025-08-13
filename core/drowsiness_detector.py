@@ -9,6 +9,15 @@ from ultralytics import YOLO
 from utils.func import calculate_mar, get_results, calculate_area, is_inside, crop_image
 import os
 import pygame
+from typing import Optional
+
+# Try to import Twilio, but don't fail if it's not available
+try:
+    from twilio.rest import Client
+    TWILIO_AVAILABLE = True
+except ImportError:
+    TWILIO_AVAILABLE = False
+    print("Warning: Twilio package not installed. SMS alerts will be disabled.")
 
 
 class DrowsinessDetector:
@@ -26,6 +35,17 @@ class DrowsinessDetector:
         self.yawn_counter = 0
         self.yawning = False
         self.frame_counter = 0
+        self.sms_sent = False  # Flag to track if SMS has been sent
+        self.twilio_client = None  # Initialize as None
+
+        # Initialize Twilio client if available and configured
+        if TWILIO_AVAILABLE and pj.validate_twilio_config():
+            try:
+                self.twilio_client = Client(pj.TWILIO_ACCOUNT_SID, pj.TWILIO_AUTH_TOKEN)
+                print("Twilio client initialized successfully")
+            except Exception as e:
+                print(f"Warning: Failed to initialize Twilio client: {e}")
+                self.twilio_client = None
 
         self.face_cascade = None
         self.left_eye_cascade = None
@@ -89,7 +109,7 @@ class DrowsinessDetector:
                     self.eye_status2 = np.argmax(pred2)
                     break
         if self.load_model and self.detect_model == "yolo":
-            results = self.yolo_model.predict(frame, conf=0.45, verbose=False)
+            results = self.yolo_model.predict(frame, conf=0.2, verbose=False)
             frame = results[0].plot()
             boxes, lst_cls = get_results(results)
 
@@ -97,44 +117,58 @@ class DrowsinessDetector:
             boxes_eyes = []
             boxes_mouths = []
 
-            # Debug print for detected classes
-            print("Detected classes:", lst_cls)
-
+            # Debug print for all detections
+            print("\nDetected objects:")
             for i, (box, cls) in enumerate(zip(boxes, lst_cls)):
+                print(f"Class {cls} at {box}")
                 if cls == 1:  # head
                     boxes_heads.append(box)
                 elif cls == 2:  # mouth/yawn
                     boxes_mouths.append(box)
-                    # Debug print for mouth detection
-                    print("Mouth detected at:", box)
                 else:  # eyes
                     boxes_eyes.append(box)
 
+            print("Head boxes:",boxes_heads)
+            print("Mouth boxes:",boxes_mouths)
+            print("Eye boxes:",boxes_eyes)
+
             # Find largest head box
-            largest_area = 0
             largest_box_head = None
-            for box in boxes_heads:
-                area = calculate_area(box)
-                if area > largest_area:
-                    largest_area = area
-                    largest_box_head = box
+            if boxes_heads:
+                largest_box_head = max(boxes_heads, key=calculate_area)
+                print(f"Head detected at: {largest_box_head}")
 
-            # Check for yawning
-            largest_mouth_ratio = 0
-            for box in boxes_mouths:
-                if is_inside(box, largest_box_head):
-                    mar = calculate_mar(box, largest_box_head)
-                    largest_mouth_ratio = max(largest_mouth_ratio, mar)
-                    # Debug print for MAR calculation
-                    print(f"MAR value: {mar}, Threshold: {pj.MAR_THRESHOLD}")
+            # Enhanced yawn detection
+            if largest_box_head is not None:
+                max_mar = 0
+                mouth_detected = False
+                current_time = time.time()
 
-            # Update yawn counter based on mouth ratio
-            if largest_mouth_ratio > pj.MAR_THRESHOLD:
-                self.yawn_counter += 1
-                print(f"Yawn counter increased to: {self.yawn_counter}")
-            else:
-                self.yawn_counter = max(0, self.yawn_counter - 1)
-                print(f"Yawn counter decreased to: {self.yawn_counter}")
+                for box in boxes_mouths:
+                    if is_inside(box, largest_box_head):
+                        mar = calculate_mar(box, largest_box_head)
+                        mouth_detected = True
+                        max_mar = max(max_mar, mar)
+                        print(f"Mouth detected - MAR: {mar:.3f}, Threshold: {pj.MAR_THRESHOLD}")
+
+                        if mar > pj.MAR_THRESHOLD:
+                            if not self.yawning:
+                                self.yawn_start_time = current_time
+                                self.yawning = True
+                            # Check if yawn has lasted more than 2 seconds
+                            if current_time - self.yawn_start_time >= 2.0:
+                                self.yawn_counter = pj.YAWN_CONSEC_FRAMES
+                                print("Yawn detected for more than 2 seconds!")
+                            else:
+                                self.yawn_counter = 0
+                            break
+
+                # Update yawn state
+                if not mouth_detected or max_mar <= pj.MAR_THRESHOLD:
+                    self.yawning = False
+                    self.yawn_counter = 0
+                
+                print(f"Final yawn state - Counter: {self.yawn_counter}, Yawning: {self.yawning}")
 
             # Check eyes
             self.both_eye_close = False
@@ -161,29 +195,77 @@ class DrowsinessDetector:
         except Exception as e:
             print(f"Error playing alarm sound: {e}")
 
+    def send_sms_alert(self):
+        """Send SMS alert using Twilio"""
+        if not self.twilio_client:
+            print("Warning: Twilio client not available. SMS alert not sent.")
+            return
+
+        try:
+            if not self.sms_sent:
+                message = self.twilio_client.messages.create(
+                    messaging_service_sid=pj.TWILIO_MESSAGING_SERVICE_SID,
+                    body='Your Dear Faiz Nakherkar has fallen asleep in his car and is not responding, please contact him immediately - Alert!',
+                    to=pj.TWILIO_TO_NUMBER
+                )
+                print(f"SMS sent successfully! SID: {message.sid}")
+                self.sms_sent = True
+        except Exception as e:
+            print(f"Error sending SMS: {e}")
+            # Don't set sms_sent to True if there was an error
+            # This allows retrying on the next frame
+
+    def reset_sms_state(self):
+        """Reset SMS state when eyes are open"""
+        self.sms_sent = False
+
     def detect_drowsiness(self, frame):
         frame = self.get_eye_status(frame)
         
-        # Reset alarm if eyes are open and not yawning
-        if not ((self.eye_status1 == 2 and self.eye_status2 == 2) or self.both_eye_close) and self.yawn_counter < pj.YAWN_CONSEC_FRAMES:
+        # More sensitive drowsiness detection
+        drowsy = (self.yawning and self.yawn_counter >= pj.YAWN_CONSEC_FRAMES) or \
+                 (self.eye_status1 == 2 and self.eye_status2 == 2) or \
+                 self.both_eye_close
+        
+        # Reset alarm and SMS state only if definitely not drowsy
+        if not drowsy and self.yawn_counter < (pj.YAWN_CONSEC_FRAMES / 3):
             if self.alarm_on:
-                self.alarm_sound.stop()  # Stop the alarm
+                self.alarm_sound.stop()
                 self.alarm_on = False
             self.time_close_eyes = 0
             self.count_start = False
+            self.reset_sms_state()  # Reset SMS state when eyes are open
         
-        # Check for yawning alert
-        if self.yawn_counter >= pj.YAWN_CONSEC_FRAMES:
-            cv2.putText(frame, "ALERT: Yawning Detected!", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            if not self.alarm_on:
-                self.alarm_on = True
-                try:
-                    t = Thread(target=self.start_alarm, args=(pj.ALARM_SOUND,))
-                    t.daemon = True
-                    t.start()
-                except Exception as e:
-                    print(f"Error starting alarm thread: {e}")
+        # Yawning detection display
+        if self.yawning:  # Show warning for any yawn detection
+            # Calculate warning intensity
+            warning_intensity = min(1.0, self.yawn_counter / pj.YAWN_CONSEC_FRAMES)
+            
+            if warning_intensity > 0.7:
+                # Red warning for significant yawning
+                cv2.rectangle(frame, (0, 70), (frame.shape[1], 140), (0, 0, 255), -1)
+                cv2.putText(frame, "DROWSINESS ALERT: Yawning Detected!", 
+                           (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                
+                # Add yawn duration display
+                elapsed = time.time() - self.yawn_start_time
+                cv2.putText(frame, f"Yawn Duration: {elapsed:.1f}s", 
+                           (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                if not self.alarm_on:
+                    self.alarm_on = True
+                    try:
+                        t = Thread(target=self.start_alarm, args=(pj.ALARM_SOUND,))
+                        t.daemon = True
+                        t.start()
+                    except Exception as e:
+                        print(f"Error starting alarm thread: {e}")
+            else:
+                # Yellow warning for initial yawn detection
+                cv2.rectangle(frame, (0, 70), (frame.shape[1], 140), (0, 255, 255), -1)
+                elapsed = time.time() - self.yawn_start_time
+                cv2.putText(frame, f"Warning: Yawning ({elapsed:.1f}s)", 
+                           (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
         
         # Drowsiness detection
         if (self.eye_status1 == 2 and self.eye_status2 == 2) or self.both_eye_close:
@@ -193,6 +275,10 @@ class DrowsinessDetector:
             if self.count_start:
                 self.end_time = time.time()
                 self.time_close_eyes = self.end_time - self.start_time
+
+                # Check if we should send SMS
+                if self.time_close_eyes >= pj.SMS_THRESHOLD:
+                    self.send_sms_alert()
 
             if self.time_close_eyes >= pj.TIME_THRESHOLD:
                 # Draw red filled rectangle at top of frame
@@ -250,5 +336,6 @@ class DrowsinessDetector:
             self.alarm_on = False
             self.time_close_eyes = 0
             self.count_start = False
+            self.reset_sms_state()  # Reset SMS state when eyes are open
 
         return frame
